@@ -1,0 +1,20 @@
+﻿service_name: cart-service
+env: local
+version: dev
+log_level: info
+shutdown_timeout: 10s
+
+grpc:
+  port: 9092
+  timeout: 5s
+
+http:
+  port: 8084
+  timeout: 5s
+
+otlp:
+  endpoint: localhost:4317
+
+mongodb:
+  uri: mongodb://localhost:27017,localhost:27018,localhost:27019/?replicaSet=rs0
+  db_name: shop_cart

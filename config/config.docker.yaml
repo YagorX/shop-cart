@@ -1,0 +1,20 @@
+﻿service_name: cart-service
+env: docker
+version: dev
+log_level: info
+shutdown_timeout: 10s
+
+grpc:
+  port: 9092
+  timeout: 5s
+
+http:
+  port: 8084
+  timeout: 5s
+
+otlp:
+  endpoint: jaeger:4317
+
+mongodb:
+  uri: mongodb://mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0
+  db_name: shop_cart
