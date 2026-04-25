@@ -2,10 +2,13 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"go.mongodb.org/mongo-driver/mongo"
@@ -16,13 +19,16 @@ import (
 	grpcapp "github.com/YagorX/shop-cart-service/internal/app/grpcapp"
 	httpapp "github.com/YagorX/shop-cart-service/internal/app/httpapp"
 	"github.com/YagorX/shop-cart-service/internal/config"
+	"github.com/YagorX/shop-cart-service/internal/lock"
 	"github.com/YagorX/shop-cart-service/internal/observability"
 	"github.com/YagorX/shop-cart-service/internal/repository/mongodb"
 	cartsvc "github.com/YagorX/shop-cart-service/internal/service/cart"
 	grpcHandlers "github.com/YagorX/shop-cart-service/internal/transport/grpc/v1/handlers"
 	httpv1 "github.com/YagorX/shop-cart-service/internal/transport/http/v1"
 	cartv1 "github.com/YagorX/shop-contracts/gen/go/proto/cart/v1"
+	goredis "github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -34,13 +40,15 @@ type App struct {
 	healthServer *health.Server
 	errCh        chan error
 
-	db *mongo.Database
+	db          *mongo.Database
+	redisClient *goredis.Client
 
 	shutdownTracing func(context.Context) error
 }
 
 type readinessChecker struct {
-	db *mongo.Client
+	db    *mongo.Client
+	redis *goredis.Client
 }
 
 func (c *readinessChecker) Check(ctx context.Context) error {
@@ -50,8 +58,14 @@ func (c *readinessChecker) Check(ctx context.Context) error {
 	if c.db == nil {
 		return errors.New("mongodb is not initialized")
 	}
+	if c.redis == nil {
+		return errors.New("redis is not initialized")
+	}
 	if err := c.db.Ping(ctx, nil); err != nil {
 		return fmt.Errorf("mongodb not ready: %w", err)
+	}
+	if err := c.redis.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("redis not ready: %w", err)
 	}
 	return nil
 }
@@ -87,6 +101,23 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		}
 	}
 
+	redisClient := goredis.NewClient(&goredis.Options{
+		Addr:     cfg.RedisAddr(),
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
+	})
+
+	pingRedisCtx, redisPingCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer redisPingCancel()
+
+	if err := redisClient.Ping(pingRedisCtx).Err(); err != nil {
+		_ = redisClient.Close()
+		stopTracing()
+		return nil, fmt.Errorf("ping redis: %w", err)
+	}
+
+	mutex := lock.NewDistributedLock(redisClient, cfg.Lock.TTL, cfg.Lock.RetryInterval, cfg.Lock.MaxRetries)
+
 	mongoClient, err := mongo.Connect(ctx, options.Client().ApplyURI(cfg.MongoDB.URI))
 	if err != nil {
 		stopTracing()
@@ -102,7 +133,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 	}
 
 	db := mongoClient.Database(cfg.MongoDB.DBName)
-	repo := mongodb.NewCartRepository(db)
+	repo := mongodb.NewCartRepository(db, mutex)
 
 	// создаём индексы при старте
 	if err := repo.EnsureIndexes(ctx); err != nil {
@@ -120,9 +151,17 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		return nil, fmt.Errorf("create grpc handler: %w", err)
 	}
 
-	grpcServer := grpc.NewServer(
+	serverOpts := []grpc.ServerOption{
 		grpc.StatsHandler(observability.GRPCServerStatsHandler()),
-	)
+	}
+	if tlsOpt, err := buildServerTLS(cfg.TLS); err != nil {
+		_ = mongoClient.Disconnect(ctx)
+		stopTracing()
+		return nil, fmt.Errorf("build grpc tls: %w", err)
+	} else if tlsOpt != nil {
+		serverOpts = append(serverOpts, tlsOpt)
+	}
+	grpcServer := grpc.NewServer(serverOpts...)
 	cartv1.RegisterCartServiceServer(grpcServer, grpcHandler)
 	grpcHealth := health.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, grpcHealth)
@@ -132,7 +171,8 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 	httpRouter := httpv1.NewRouter(httpv1.RouterDeps{
 		LogLevelController: runtimeLogger,
 		ReadinessChecker: &readinessChecker{
-			db: mongoClient,
+			db:    mongoClient,
+			redis: redisClient,
 		},
 	})
 
@@ -161,6 +201,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		httpApp:         httpRuntime,
 		grpcApp:         grpcRuntime,
 		db:              db,
+		redisClient:     redisClient,
 		shutdownTracing: shutdownTracing,
 		healthServer:    grpcHealth,
 		errCh:           make(chan error, 2),
@@ -200,6 +241,40 @@ func (a *App) Errors() <-chan error {
 	return a.errCh
 }
 
+// buildServerTLS строит серверные TLS credentials для gRPC.
+// Если TLS выключен — возвращает nil, nil (сервер поднимается без шифрования).
+// Если включён — загружает сертификат сервера и CA для проверки клиентских сертификатов (mTLS).
+func buildServerTLS(cfg config.TLSConfig) (grpc.ServerOption, error) {
+	if !cfg.Enabled {
+		return nil, nil
+	}
+
+	// Загружаем сертификат и ключ самого сервера
+	serverCert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load server cert/key: %w", err)
+	}
+
+	// Загружаем CA — им будем проверять сертификаты входящих клиентов
+	caPEM, err := os.ReadFile(cfg.CAFile)
+	if err != nil {
+		return nil, fmt.Errorf("read ca file: %w", err)
+	}
+	clientCA := x509.NewCertPool()
+	if !clientCA.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("failed to parse ca certificate")
+	}
+
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert, // mTLS: клиент обязан предъявить сертификат
+		ClientCAs:    clientCA,
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	return grpc.Creds(credentials.NewTLS(tlsCfg)), nil
+}
+
 func (a *App) Shutdown(ctx context.Context) error {
 	if a == nil {
 		return nil
@@ -221,6 +296,12 @@ func (a *App) Shutdown(ctx context.Context) error {
 	if a.db != nil {
 		if err := a.db.Client().Disconnect(ctx); err != nil {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("disconnect mongo client: %w", err))
+		}
+	}
+
+	if a.redisClient != nil {
+		if err := a.redisClient.Close(); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close redis: %w", err))
 		}
 	}
 

@@ -18,11 +18,27 @@ type Config struct {
 	HTTP            HTTPConfig    `yaml:"http"`
 	OTLP            OTLPConfig    `yaml:"otlp"`
 	MongoDB         MongoDBConfig `yaml:"mongodb"`
+	TLS             TLSConfig     `yaml:"tls"`
+	Redis           RedisConfig   `yaml:"redis"`
+	Lock            LockConfig    `yaml:"lock"`
+}
+
+type LockConfig struct {
+	TTL           time.Duration `yaml:"ttl" env-default:"30s"`
+	RetryInterval time.Duration `yaml:"retry_interval" env-default:"100ms"`
+	MaxRetries    int           `yaml:"max_retries" env-default:"50"`
 }
 
 type GRPCConfig struct {
 	Port    int           `yaml:"port" env-default:"9092"`
 	Timeout time.Duration `yaml:"timeout" env-default:"5s"`
+}
+
+type TLSConfig struct {
+	Enabled  bool   `yaml:"enabled" env-default:"false"`
+	CertFile string `yaml:"cert_file" env-default:""`
+	KeyFile  string `yaml:"key_file" env-default:""`
+	CAFile   string `yaml:"ca_file" env-default:""`
 }
 
 // HTTPConfig holds configuration for the HTTP server.
@@ -40,6 +56,14 @@ type MongoDBConfig struct {
 	DBName   string `yaml:"db_name" env:"MONGODB_DB_NAME" env-default:"shop_cart"`
 	Username string `yaml:"username" env:"MONGODB_USERNAME" env-default:""`
 	Password string `yaml:"password" env:"MONGODB_PASSWORD" env-default:""`
+}
+
+type RedisConfig struct {
+	Host     string        `yaml:"host" env:"REDIS_HOST" env-default:"localhost"`
+	Port     int           `yaml:"port" env:"REDIS_PORT" env-default:"6379"`
+	Password string        `yaml:"password" env:"REDIS_PASSWORD" env-default:""`
+	DB       int           `yaml:"db" env:"REDIS_DB" env-default:"0"`
+	TTL      time.Duration `yaml:"ttl" env:"REDIS_TTL" env-default:"5m"`
 }
 
 // MustLoad is a bootstrap helper for main().
@@ -122,6 +146,18 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("mongodb.uri is required")
 	}
 
+	if c.TLS.Enabled {
+		if c.TLS.CertFile == "" {
+			return fmt.Errorf("tls.cert_file is required when tls.enabled=true")
+		}
+		if c.TLS.KeyFile == "" {
+			return fmt.Errorf("tls.key_file is required when tls.enabled=true")
+		}
+		if c.TLS.CAFile == "" {
+			return fmt.Errorf("tls.ca_file is required when tls.enabled=true")
+		}
+	}
+
 	return nil
 }
 
@@ -131,4 +167,7 @@ func (c Config) GRPCAddr() string {
 
 func (c Config) HTTPAddr() string {
 	return fmt.Sprintf(":%d", c.HTTP.Port)
+}
+func (c Config) RedisAddr() string {
+	return fmt.Sprintf("%s:%d", c.Redis.Host, c.Redis.Port)
 }

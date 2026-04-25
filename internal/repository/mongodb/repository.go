@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/YagorX/shop-cart-service/internal/domain"
+	"github.com/YagorX/shop-cart-service/internal/lock"
 	"github.com/YagorX/shop-cart-service/internal/observability"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -15,11 +16,13 @@ import (
 
 type cartRepository struct {
 	collection *mongo.Collection
+	lock       *lock.DistributedLock
 }
 
-func NewCartRepository(db *mongo.Database) *cartRepository {
+func NewCartRepository(db *mongo.Database, lock *lock.DistributedLock) *cartRepository {
 	return &cartRepository{
 		collection: db.Collection("carts"),
+		lock:       lock,
 	}
 }
 
@@ -54,6 +57,12 @@ func (c *cartRepository) AddItem(ctx context.Context, userID string, item domain
 	defer func() {
 		metrics.CartMongoRequestDuration.WithLabelValues("AddItem").Observe(time.Since(startedAt).Seconds())
 	}()
+
+	lockValue, err := c.lock.Lock(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("lock cart: %w", err)
+	}
+	defer c.lock.Unlock(ctx, userID, lockValue)
 
 	slog.Debug("mongo AddItem", slog.String("op", op), slog.String("user_id", userID),
 		slog.String("product_id", item.ProductID))
@@ -115,6 +124,12 @@ func (c *cartRepository) RemoveItem(ctx context.Context, userID string, productI
 		metrics.CartMongoRequestDuration.WithLabelValues("RemoveItem").Observe(time.Since(startedAt).Seconds())
 	}()
 
+	lockValue, err := c.lock.Lock(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("lock cart: %w", err)
+	}
+	defer c.lock.Unlock(ctx, userID, lockValue)
+
 	slog.Debug("mongo RemoveItem", slog.String("op", op), slog.String("user_id", userID),
 		slog.String("product_id", productID))
 
@@ -155,6 +170,12 @@ func (c *cartRepository) UpdateItem(ctx context.Context, userID string, productI
 		metrics.CartMongoRequestDuration.WithLabelValues("UpdateItem").Observe(time.Since(startedAt).Seconds())
 	}()
 
+	lockValue, err := c.lock.Lock(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("lock cart: %w", err)
+	}
+	defer c.lock.Unlock(ctx, userID, lockValue)
+
 	slog.Debug("mongo UpdateItem", slog.String("op", op), slog.String("user_id", userID),
 		slog.String("product_id", productID), slog.Int("quantity", int(quantity)))
 
@@ -194,6 +215,12 @@ func (c *cartRepository) ClearCart(ctx context.Context, userID string) error {
 		metrics.CartMongoRequestDuration.WithLabelValues("ClearCart").Observe(time.Since(startedAt).Seconds())
 	}()
 
+	lockValue, err := c.lock.Lock(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("lock cart: %w", err)
+	}
+	defer c.lock.Unlock(ctx, userID, lockValue)
+
 	slog.Debug("mongo ClearCart", slog.String("op", op), slog.String("user_id", userID))
 
 	filter := bson.D{{Key: "user_id", Value: userID}}
@@ -229,6 +256,7 @@ func (c *cartRepository) GetCart(ctx context.Context, userID string) (*domain.Ca
 		metrics.CartMongoRequestDuration.WithLabelValues("GetCart").Observe(time.Since(startedAt).Seconds())
 	}()
 
+	// GetCart - read операция, lock не нужен (для производительности)
 	slog.Debug("mongo GetCart", slog.String("op", op), slog.String("user_id", userID))
 
 	filter := bson.D{{Key: "user_id", Value: userID}}

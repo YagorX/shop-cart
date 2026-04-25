@@ -18,3 +18,18 @@ otlp:
 mongodb:
   uri: mongodb://localhost:27017,localhost:27018,localhost:27019/?replicaSet=rs0
   db_name: shop_cart
+
+tls:
+  enabled: false
+
+redis:
+  host: localhost
+  port: 6379
+  password: ""
+  db: 0
+  ttl: 5m
+
+lock:
+  ttl: 30s
+  retry_interval: 100ms
+  max_retries: 50
