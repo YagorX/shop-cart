@@ -8,8 +8,9 @@ import (
 )
 
 var (
-	ErrCartNotFound = errors.New("cart not found")
-	ErrItemNotFound = errors.New("item not found")
+	ErrCartNotFound          = errors.New("cart not found")
+	ErrItemNotFound          = errors.New("item not found")
+	ErrEventAlreadyProcessed = errors.New("event already processed")
 )
 
 type CartItem struct {
@@ -17,6 +18,7 @@ type CartItem struct {
 	Quantity             int32     `bson:"quantity"`
 	PriceSnapshotKopecks int64     `bson:"price_snapshot_kopecks"`
 	AddedAt              time.Time `bson:"added_at"`
+	Unavailable          bool      `bson:"unavailable,omitempty"`
 }
 
 type Cart struct {

@@ -187,6 +187,7 @@ func (h *Handler) GetCart(ctx context.Context, req *cartv1.GetCartRequest) (*car
 			Quantity:      it.Quantity,
 			PriceSnapshot: it.PriceSnapshotKopecks,
 			AddedAt:       timestamppb.New(it.AddedAt),
+			Unavailable:   it.Unavailable,
 		})
 	}
 

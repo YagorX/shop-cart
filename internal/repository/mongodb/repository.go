@@ -2,6 +2,7 @@ package mongodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -15,14 +16,16 @@ import (
 )
 
 type cartRepository struct {
-	collection *mongo.Collection
-	lock       *lock.DistributedLock
+	collection      *mongo.Collection
+	processedEvents *mongo.Collection
+	lock            *lock.DistributedLock
 }
 
 func NewCartRepository(db *mongo.Database, lock *lock.DistributedLock) *cartRepository {
 	return &cartRepository{
-		collection: db.Collection("carts"),
-		lock:       lock,
+		collection:      db.Collection("carts"),
+		processedEvents: db.Collection("processed_events"),
+		lock:            lock,
 	}
 }
 
@@ -47,6 +50,15 @@ func (r *cartRepository) EnsureIndexes(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("ensure indexes: %w", err)
 	}
+
+	_, err = r.processedEvents.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "processed_at", Value: 1}},
+		Options: options.Index().SetName("processed_at"),
+	})
+	if err != nil {
+		return fmt.Errorf("ensure processed events indexes: %w", err)
+	}
+
 	return nil
 }
 
@@ -278,4 +290,184 @@ func (c *cartRepository) GetCart(ctx context.Context, userID string) (*domain.Ca
 		slog.Int("items", len(cart.Items)),
 		slog.Int64("duration_ms", time.Since(startedAt).Milliseconds()))
 	return &cart, nil
+}
+
+// MarkItemUnavailableByProductID помечает товар как недоступный во ВСЕХ корзинах
+// где он встречается. Используется когда stock товара стал 0.
+func (c *cartRepository) MarkItemUnavailableByProductID(ctx context.Context, eventID string, productID string) (int64, error) {
+	const op = "repository.mongodb.MarkItemUnavailableByProductID"
+	startedAt := time.Now()
+	metrics := observability.MustMetrics()
+	defer func() {
+		metrics.CartMongoRequestDuration.WithLabelValues("MarkItemUnavailable").Observe(time.Since(startedAt).Seconds())
+	}()
+
+	slog.Debug("mongo MarkItemUnavailable", slog.String("op", op), slog.String("product_id", productID))
+
+	filter := bson.D{
+		{Key: "items.product_id", Value: productID},
+	}
+	update := bson.D{
+		{Key: "$set", Value: bson.D{
+			{Key: "items.$[item].unavailable", Value: true},
+			{Key: "updated_at", Value: time.Now()},
+		}},
+	}
+
+	// arrayFilters — обновляем только нужный элемент массива items
+	opts := options.Update().SetArrayFilters(options.ArrayFilters{
+		Filters: []interface{}{
+			bson.D{{Key: "item.product_id", Value: productID}},
+		},
+	})
+
+	session, err := c.collection.Database().Client().StartSession()
+	if err != nil {
+		return 0, fmt.Errorf("start mongo session: %w", err)
+	}
+	defer session.EndSession(ctx)
+
+	var modifiedCount int64
+	var matchedCount int64
+
+	_, err = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+		_, err := c.processedEvents.InsertOne(sc, bson.D{
+			{Key: "_id", Value: eventID},
+			{Key: "event_type", Value: "stock.changed"},
+			{Key: "product_id", Value: productID},
+			{Key: "processed_at", Value: time.Now()},
+		})
+		if err != nil {
+			if mongo.IsDuplicateKeyError(err) {
+				return nil, domain.ErrEventAlreadyProcessed
+			}
+			return nil, fmt.Errorf("insert processed event: %w", err)
+		}
+
+		result, err := c.collection.UpdateMany(sc, filter, update, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		modifiedCount = result.ModifiedCount
+		matchedCount = result.MatchedCount
+		return nil, nil
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrEventAlreadyProcessed) {
+			slog.Info("catalog event already processed",
+				slog.String("event_id", eventID),
+				slog.String("product_id", productID),
+			)
+			return 0, nil
+		}
+		metrics.CartMongoRequestsTotal.WithLabelValues("MarkItemUnavailable", "error").Inc()
+		slog.Error("mongo MarkItemUnavailable failed",
+			slog.String("op", op),
+			slog.String("event_id", eventID),
+			slog.String("product_id", productID),
+			slog.String("error", err.Error()),
+		)
+		return 0, err
+	}
+
+	metrics.CartMongoRequestsTotal.WithLabelValues("MarkItemUnavailable", "ok").Inc()
+	slog.Info("mongo MarkItemUnavailable ok",
+		slog.String("op", op),
+		slog.String("event_id", eventID),
+		slog.String("product_id", productID),
+		slog.Int64("matched_count", matchedCount),
+		slog.Int64("modified_count", modifiedCount),
+		slog.Int64("duration_ms", time.Since(startedAt).Milliseconds()),
+	)
+
+	return modifiedCount, nil
+}
+
+// MarkItemAvailableByProductID — обратная операция, вызывается когда товар снова появился
+func (c *cartRepository) MarkItemAvailableByProductID(ctx context.Context, eventID string, productID string) (int64, error) {
+	const op = "repository.mongodb.MarkItemAvailableByProductID"
+	startedAt := time.Now()
+	metrics := observability.MustMetrics()
+	defer func() {
+		metrics.CartMongoRequestDuration.WithLabelValues("MarkItemAvailable").Observe(time.Since(startedAt).Seconds())
+	}()
+
+	filter := bson.D{
+		{Key: "items.product_id", Value: productID},
+	}
+	update := bson.D{
+		{Key: "$set", Value: bson.D{
+			{Key: "items.$[item].unavailable", Value: false},
+			{Key: "updated_at", Value: time.Now()},
+		}},
+	}
+
+	opts := options.Update().SetArrayFilters(options.ArrayFilters{
+		Filters: []interface{}{
+			bson.D{{Key: "item.product_id", Value: productID}},
+		},
+	})
+
+	session, err := c.collection.Database().Client().StartSession()
+	if err != nil {
+		return 0, fmt.Errorf("start mongo session: %w", err)
+	}
+	defer session.EndSession(ctx)
+
+	var modifiedCount int64
+	var matchedCount int64
+
+	_, err = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+		_, err := c.processedEvents.InsertOne(sc, bson.D{
+			{Key: "_id", Value: eventID},
+			{Key: "event_type", Value: "stock.changed"},
+			{Key: "product_id", Value: productID},
+			{Key: "processed_at", Value: time.Now()},
+		})
+		if err != nil {
+			if mongo.IsDuplicateKeyError(err) {
+				return nil, domain.ErrEventAlreadyProcessed
+			}
+			return nil, fmt.Errorf("insert processed event: %w", err)
+		}
+
+		result, err := c.collection.UpdateMany(sc, filter, update, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		modifiedCount = result.ModifiedCount
+		matchedCount = result.MatchedCount
+		return nil, nil
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrEventAlreadyProcessed) {
+			slog.Info("catalog event already processed",
+				slog.String("event_id", eventID),
+				slog.String("product_id", productID),
+			)
+			return 0, nil
+		}
+		metrics.CartMongoRequestsTotal.WithLabelValues("MarkItemAvailable", "error").Inc()
+		slog.Error("mongo MarkItemAvailable failed",
+			slog.String("op", op),
+			slog.String("event_id", eventID),
+			slog.String("product_id", productID),
+			slog.String("error", err.Error()),
+		)
+		return 0, err
+	}
+
+	metrics.CartMongoRequestsTotal.WithLabelValues("MarkItemAvailable", "ok").Inc()
+	slog.Info("mongo MarkItemAvailable ok",
+		slog.String("op", op),
+		slog.String("event_id", eventID),
+		slog.String("product_id", productID),
+		slog.Int64("matched_count", matchedCount),
+		slog.Int64("modified_count", modifiedCount),
+		slog.Int64("duration_ms", time.Since(startedAt).Milliseconds()),
+	)
+
+	return modifiedCount, nil
 }

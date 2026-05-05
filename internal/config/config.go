@@ -21,6 +21,7 @@ type Config struct {
 	TLS             TLSConfig     `yaml:"tls"`
 	Redis           RedisConfig   `yaml:"redis"`
 	Lock            LockConfig    `yaml:"lock"`
+	KafkaBrokers    []string      `yaml:"kafka_brokers" env:"KAFKA_BROKERS" env-default:"localhost:9092"`
 }
 
 type LockConfig struct {

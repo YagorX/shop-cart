@@ -19,6 +19,7 @@ import (
 	grpcapp "github.com/YagorX/shop-cart-service/internal/app/grpcapp"
 	httpapp "github.com/YagorX/shop-cart-service/internal/app/httpapp"
 	"github.com/YagorX/shop-cart-service/internal/config"
+	"github.com/YagorX/shop-cart-service/internal/events"
 	"github.com/YagorX/shop-cart-service/internal/lock"
 	"github.com/YagorX/shop-cart-service/internal/observability"
 	"github.com/YagorX/shop-cart-service/internal/repository/mongodb"
@@ -42,6 +43,10 @@ type App struct {
 
 	db          *mongo.Database
 	redisClient *goredis.Client
+
+	consumer       *events.CatalogEventConsumer
+	consumerCancel context.CancelFunc
+	consumerDone   chan struct{}
 
 	shutdownTracing func(context.Context) error
 }
@@ -196,6 +201,9 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		return nil, fmt.Errorf("create http app: %w", err)
 	}
 
+	eventHandler := events.NewCatalogEventHandler(runtimeLogger.Logger, repo)
+	catalogConsumer := events.NewCatalogEventConsumer(cfg.KafkaBrokers, eventHandler, runtimeLogger.Logger)
+
 	return &App{
 		logger:          runtimeLogger.Logger,
 		httpApp:         httpRuntime,
@@ -204,7 +212,9 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		redisClient:     redisClient,
 		shutdownTracing: shutdownTracing,
 		healthServer:    grpcHealth,
-		errCh:           make(chan error, 2),
+		consumer:        catalogConsumer,
+		consumerDone:    make(chan struct{}),
+		errCh:           make(chan error, 3),
 	}, nil
 }
 
@@ -225,10 +235,20 @@ func (a *App) Run() error {
 		}
 	}()
 
+	consumerCtx, consumercancel := context.WithCancel(context.Background())
+	a.consumerCancel = consumercancel
+	go func() {
+		defer close(a.consumerDone)
+		if err := a.consumer.Run(consumerCtx); err != nil {
+			a.errCh <- fmt.Errorf("catalog event consumer failed: %w", err)
+		}
+	}()
+
 	a.logger.Info("cart service bootstrap completed",
 		slog.String("grpc_addr", a.grpcApp.Addr()),
 		slog.String("http_addr", a.httpApp.Addr()),
 		slog.String("repository_backend", "mongodb"),
+		slog.String("kafka_consumer", "enabled"),
 	)
 
 	return nil
@@ -281,6 +301,24 @@ func (a *App) Shutdown(ctx context.Context) error {
 	}
 
 	var shutdownErr error
+
+	if a.consumerCancel != nil {
+		a.consumerCancel()
+
+		// Ждём завершения горутины consumer'а с таймаутом
+		select {
+		case <-a.consumerDone:
+			a.logger.Info("kafka consumer stopped gracefully")
+		case <-time.After(5 * time.Second):
+			a.logger.Warn("kafka consumer shutdown timeout")
+		}
+
+		if a.consumer != nil {
+			if err := a.consumer.Close(); err != nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close kafka consumer: %w", err))
+			}
+		}
+	}
 
 	if a.grpcApp != nil {
 		a.healthServer.SetServingStatus("proto.cart.v1.CartService", healthpb.HealthCheckResponse_NOT_SERVING)

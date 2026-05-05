@@ -34,3 +34,7 @@ lock:
   retry_interval: 100ms
   max_retries: 50
 
+kafka_brokers:
+  - kafka-1:9092
+  - kafka-2:9092
+  - kafka-3:9092
