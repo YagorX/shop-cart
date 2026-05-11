@@ -2,6 +2,8 @@ module github.com/YagorX/shop-cart-service
 
 go 1.25.0
 
+replace github.com/YagorX/shop-contracts => ../shop-contracts
+
 require (
 	github.com/YagorX/shop-contracts v0.0.0-20260503120314-3b5918cd07f8
 	github.com/google/uuid v1.6.0
